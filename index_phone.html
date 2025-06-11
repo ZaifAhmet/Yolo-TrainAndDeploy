@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Phone Camera YOLO</title>
+    <style>
+        body { font-family: sans-serif; margin: 15px; background-color: #eee; }
+        h1 { text-align: center; color: #333; }
+        .container { display: flex; flex-direction: column; align-items: center; gap: 15px; }
+        #videoElement, #processedStream {
+            max-width: 95%;
+            height: auto;
+            border: 1px solid #ccc;
+            background-color: #000;
+        }
+        #videoElement { display: none; } /* Ham kamera akışını gizleyebiliriz */
+        canvas { display: none; } /* Canvas'ı da gizleyebiliriz */
+        button { padding: 10px 15px; font-size: 1em; cursor: pointer; }
+        #status { margin-top: 10px; color: #555; min-height: 1.2em; }
+    </style>
+</head>
+<body>
+
+    <h1>YOLO Detection using Phone Camera</h1>
+
+    <div class="container">
+        <button id="startButton">Start Camera</button>
+        <div id="status">Camera stopped.</div>
+
+        <!-- Ham kamera görüntüsü için (gizli) -->
+        <video id="videoElement" playsinline autoplay muted></video>
+
+        <!-- İşlenmiş sonucu göstermek için -->
+        <img id="processedStream" alt="Processed Stream">
+
+        <!-- Kareleri yakalamak için gizli canvas -->
+        <canvas id="canvasElement"></canvas>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('videoElement');
+        const canvasElement = document.getElementById('canvasElement');
+        const canvasCtx = canvasElement.getContext('2d');
+        const processedStreamElement = document.getElementById('processedStream');
+        const startButton = document.getElementById('startButton');
+        const statusElement = document.getElementById('status');
+
+        const UPLOAD_INTERVAL_MS = 100; // Sunucuya ne sıklıkla kare gönderileceği (ms)
+                                        // Daha düşük = daha akıcı ama daha çok ağ/CPU kullanımı
+                                        // Daha yüksek = daha az akıcı ama daha az kaynak kullanımı
+        let stream = null;
+        let intervalId = null;
+        let isStreaming = false;
+
+        async function startCamera() {
+            if (isStreaming) return;
+
+            statusElement.textContent = 'Requesting camera access...';
+            try {
+                // Arka kamerayı tercih etmeye çalış
+                const constraints = {
+                    video: {
+                        facingMode: 'environment', // 'user' ön kamera için
+                        // İsteğe bağlı: Çözünürlüğü sınırlayabiliriz
+                        width: { ideal: 640 },
+                        height: { ideal: 480 }
+                    },
+                    audio: false
+                };
+                stream = await navigator.mediaDevices.getUserMedia(constraints);
+                videoElement.srcObject = stream;
+                videoElement.style.display = 'block'; // Ham akışı göstermek isterseniz 'block' yapın
+
+                // Video boyutları hazır olunca canvas'ı ayarla ve gönderimi başlat
+                videoElement.onloadedmetadata = () => {
+                    canvasElement.width = videoElement.videoWidth;
+                    canvasElement.height = videoElement.videoHeight;
+                    startSendingFrames();
+                    statusElement.textContent = 'Camera started. Sending frames...';
+                    startButton.textContent = 'Stop Camera';
+                    isStreaming = true;
+
+                    // İşlenmiş akışı göstermeye başla (MJPEG endpoint'i)
+                    // Rastgele bir parametre ekleyerek cache'lemeyi engelle
+                    processedStreamElement.src = `/video_feed?${Date.now()}`;
+                    processedStreamElement.style.display = 'block';
+                };
+
+            } catch (err) {
+                console.error("Error accessing camera:", err);
+                statusElement.textContent = `Error accessing camera: ${err.name} - ${err.message}`;
+                alert("Could not access the camera. Please ensure permissions are granted and try again.");
+            }
+        }
+
+        function stopCamera() {
+            if (!isStreaming) return;
+
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+            }
+            if (intervalId) {
+                clearInterval(intervalId);
+                intervalId = null;
+            }
+            videoElement.srcObject = null;
+            videoElement.style.display = 'none';
+            processedStreamElement.style.display = 'none'; // İşlenmiş akışı da durdur
+            processedStreamElement.src = ""; // Kaynağı temizle
+            statusElement.textContent = 'Camera stopped.';
+            startButton.textContent = 'Start Camera';
+            isStreaming = false;
+            console.log("Camera and frame sending stopped.");
+        }
+
+        function startSendingFrames() {
+            if (intervalId) {
+                clearInterval(intervalId); // Önceki intervali temizle (varsa)
+            }
+            intervalId = setInterval(sendFrameToServer, UPLOAD_INTERVAL_MS);
+            console.log(`Started sending frames every ${UPLOAD_INTERVAL_MS}ms`);
+        }
+
+        async function sendFrameToServer() {
+            if (!isStreaming || videoElement.paused || videoElement.ended) {
+                return; // Video akmıyorsa gönderme
+            }
+
+            try {
+                // Videodan mevcut kareyi canvas'a çiz
+                canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+
+                // Canvas'ı JPEG formatında Base64 string'e çevir
+                // Kaliteyi düşürerek veri boyutunu azaltabilirsiniz (örn: 0.8 = %80 kalite)
+                const imageDataUrl = canvasElement.toDataURL('image/jpeg', 0.7);
+
+                // Sunucuya POST isteği ile gönder
+                const response = await fetch('/upload_frame', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ image: imageDataUrl }),
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    console.error('Error sending frame:', response.status, errorData);
+                    statusElement.textContent = `Error sending frame: ${response.status}`;
+                    // Hata durumunda belki gönderimi durdurmak isteyebilirsiniz
+                    // stopCamera();
+                } else {
+                     // Başarılı, durum mesajını güncelleyebiliriz (isteğe bağlı)
+                     // statusElement.textContent = 'Streaming...';
+                     console.log("Frame sent successfully.");
+                }
+            } catch (error) {
+                console.error('Error in sendFrameToServer:', error);
+                statusElement.textContent = 'Network or other error occurred.';
+                // Ağ hatası gibi durumlarda durdurmak mantıklı olabilir
+                // stopCamera();
+            }
+        }
+
+        startButton.addEventListener('click', () => {
+            if (isStreaming) {
+                stopCamera();
+            } else {
+                startCamera();
+            }
+        });
+
+        // Sayfa kapanırken kamerayı durdur
+        window.addEventListener('beforeunload', stopCamera);
+
+    </script>
+
+</body>
+</html>
